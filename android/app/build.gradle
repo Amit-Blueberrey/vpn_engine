@@ -1,0 +1,65 @@
+// android/app/build.gradle
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace "com.vpnengine"
+    compileSdk 34
+    ndkVersion "25.2.9519653"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    defaultConfig {
+        applicationId "com.vpnengine"
+        minSdk 26           // Android 8.0 – required for foregroundServiceType
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+
+        ndk {
+            // Include wg-go pre-built .so for these ABIs
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false       // Enable with proper ProGuard rules in production
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug  // Replace with release signing
+        }
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+
+    // AndroidX Core
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+
+    // WireGuard Android (official – includes wg-go JNI .so files)
+    // !! REQUIRED: Download from https://github.com/WireGuard/wireguard-android
+    // or use the Maven artifact when available:
+    // implementation 'com.wireguard.android:tunnel:1.0.20230706'
+
+    // BouncyCastle for key generation fallback
+    implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
+
+    // JSON
+    implementation 'org.json:json:20231013'
+}

@@ -13,7 +13,7 @@ dependencies:
 
   # ── State management ────────────────────────────────────────────────────────
   # NOTE: Riverpod 3.x moved ChangeNotifierProvider to legacy.dart
-  provider: ^6.1.2
+  provider: ^6.1.5+1
   flutter_riverpod: ^3.1.0
   riverpod: ^3.1.0
 
@@ -63,6 +63,7 @@ dependencies:
 
   # ── Intl/formatting ──────────────────────────────────────────────────────────
   intl: ^0.20.2
+  wireguard_flutter: ^0.1.3
 
 dev_dependencies:
   flutter_test:

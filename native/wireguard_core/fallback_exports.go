@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unsafe"
 
 	"wireguard_engine/fallback"
 )
@@ -64,6 +65,7 @@ func wg_tunnel_start_with_fallback(
 	}
 
 	// Step 3: Handshake failed ── tear down UDP tunnel
+	nativeLog("UDP handshake failed after %v, attempting TCP fallback via %s", timeout, relayURL)
 	wg_tunnel_stop(handle)
 
 	if relayURL == "" {
@@ -90,7 +92,7 @@ func wg_tunnel_start_with_fallback(
 
 	// Step 7: Start the WireGuard tunnel pointing at localhost relay
 	relayCfgC := C.CString(relayCfg)
-	defer C.free(relayCfgC) //nolint: staticcheck -- acceptable in CGO
+	defer C.free(unsafe.Pointer(relayCfgC)) //nolint: staticcheck -- acceptable in CGO
 	newHandle := wg_tunnel_start(relayCfgC, nameC, fdC)
 	if newHandle == C.int32_t(-1) {
 		fbTunnel.Close()
@@ -153,7 +155,7 @@ func probeHandshake(handle C.int32_t, timeout time.Duration) bool {
 			}
 			// A successful handshake increments rx_bytes if any data
 			// was exchanged, OR we can check t.state == stateConnected.
-			if t.state == stateConnected && t.rxBytes > 0 {
+			if t.state == stateConnected && (t.lastHandshakeSec > 0 || t.rxBytes > 0) {
 				return true
 			}
 		}

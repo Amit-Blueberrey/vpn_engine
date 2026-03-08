@@ -118,4 +118,78 @@ class VpnConfig {
     buf.writeln('PersistentKeepalive = 25');
     return buf.toString();
   }
+
+  Map<String, dynamic> toJson() => {
+        'privateKey': privateKey,
+        'address': address,
+        'serverPublicKey': serverPublicKey,
+        'endpoint': endpoint,
+        'allowedIPs': allowedIPs,
+        'dns': dns,
+        'presharedKey': presharedKey,
+        'mtu': mtu,
+        'tunnelName': tunnelName,
+        'autoFallback': autoFallback,
+        'relayUrl': relayUrl,
+        'relayToken': relayToken,
+      };
+
+  factory VpnConfig.fromJson(Map<String, dynamic> json) => VpnConfig(
+        privateKey: json['privateKey'] as String,
+        address: json['address'] as String,
+        serverPublicKey: json['serverPublicKey'] as String,
+        endpoint: json['endpoint'] as String,
+        allowedIPs: json['allowedIPs'] as String,
+        dns: json['dns'] as String?,
+        presharedKey: json['presharedKey'] as String?,
+        mtu: json['mtu'] as int? ?? 1420,
+        tunnelName: json['tunnelName'] as String? ?? 'wg0',
+        autoFallback: json['autoFallback'] as bool? ?? false,
+        relayUrl: json['relayUrl'] as String? ?? '',
+        relayToken: json['relayToken'] as String? ?? '',
+      );
+}
+
+/// Represents a server saved in the user's list.
+class SavedServer {
+  final String id;
+  final String name;
+  final String country;
+  final String flagEmoji;
+  final VpnConfig config;
+  final int? latencyMs;
+
+  const SavedServer({
+    required this.id,
+    required this.name,
+    required this.country,
+    required this.flagEmoji,
+    required this.config,
+    this.latencyMs,
+  });
+
+  SavedServer copyWith({int? latencyMs}) => SavedServer(
+        id: id,
+        name: name,
+        country: country,
+        flagEmoji: flagEmoji,
+        config: config,
+        latencyMs: latencyMs ?? this.latencyMs,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'country': country,
+        'flagEmoji': flagEmoji,
+        'config': config.toJson(),
+      };
+
+  factory SavedServer.fromJson(Map<String, dynamic> json) => SavedServer(
+        id: json['id'] as String,
+        name: json['name'] as String,
+        country: json['country'] as String,
+        flagEmoji: json['flagEmoji'] as String,
+        config: VpnConfig.fromJson(json['config'] as Map<String, dynamic>),
+      );
 }

@@ -1,14 +1,27 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:get_storage/get_storage.dart';
 
 import 'engine/vpn_engine.dart';
-import 'ui/dashboard_screen.dart';
+import 'services/server_repository.dart';
+import 'ui/home_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize GetStorage
+  await GetStorage.init();
+  
+  // Initialize server storage
+  await ServerRepository.instance.init();
+
   runApp(
-    ChangeNotifierProvider.value(
-      value: VpnEngine.instance,
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: VpnEngine.instance),
+        ChangeNotifierProvider.value(value: ServerRepository.instance),
+      ],
       child: const VpnApp(),
     ),
   );
@@ -26,7 +39,7 @@ class VpnApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF0E0E1A),
         textTheme: GoogleFonts.interTextTheme(ThemeData.dark().textTheme),
       ),
-      home: const DashboardScreen(),
+      home: const HomeScreen(),
     );
   }
 }

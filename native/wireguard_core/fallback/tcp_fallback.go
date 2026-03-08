@@ -21,7 +21,7 @@
 // The remote server side is a tiny Go WebSocket relay (see docs/wstunnel_server.go).
 // Popular open-source option: github.com/erebe/wstunnel (written in Rust, drop-in).
 
-package main
+package fallback
 
 import (
 	"context"
@@ -99,10 +99,21 @@ func NewTCPFallbackTunnel(cfg TCPFallbackConfig) (*TCPFallbackTunnel, error) {
 	}
 	_ = transport // used implicitly by websocket.DialConfig
 
-	wsConn, err := websocket.DialConfig(wsConfig)
-	if err != nil {
+	var wsConn *websocket.Conn
+	var dialErr error
+	for i := 0; i < 3; i++ {
+		wsConn, dialErr = websocket.DialConfig(wsConfig)
+		if dialErr == nil {
+			break
+		}
+		if i < 2 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	if dialErr != nil {
 		udpLn.Close()
-		return nil, fmt.Errorf("websocket dial: %w", err)
+		return nil, fmt.Errorf("websocket dial (after retries): %w", dialErr)
 	}
 	wsConn.PayloadType = websocket.BinaryFrame
 

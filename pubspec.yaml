@@ -68,6 +68,8 @@ dependencies:
 
   # ── Fonts ────────────────────────────────────────────────────────────────────
   google_fonts: ^6.2.1
+  get_storage: ^2.1.1
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:

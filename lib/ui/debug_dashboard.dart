@@ -106,17 +106,40 @@ class _DebugDashboardState extends State<DebugDashboard>
   MicroState _microState = MicroState.idle;
   final List<(DateTime, MicroState)> _stateHistory = [];
 
+  StreamSubscription? _logSub;
+  final ScrollController _terminalScroll = ScrollController();
+  final List<String> _nativeLogs = [];
+
   // ── Init & Dispose ───────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    _tabs = TabController(length: 4, vsync: this);
+    _tabs = TabController(length: 5, vsync: this);
+    WireGuardCore.instance.initializeLogging(); // Ensure FFI is ready
+    _logSub = VpnEngine.instance.nativeLogsStream.listen((msg) {
+      if (!mounted) return;
+      setState(() {
+        _nativeLogs.add('[${DateTime.now().toIso8601String().substring(11,23)}] $msg');
+        if (_nativeLogs.length > 500) _nativeLogs.removeAt(0); // keep it tidy
+      });
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (_terminalScroll.hasClients) {
+          _terminalScroll.animateTo(
+            _terminalScroll.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOut,
+          );
+        }
+      });
+    });
     _startPolling();
   }
 
   @override
   void dispose() {
+    _logSub?.cancel();
+    _terminalScroll.dispose();
     _tabs.dispose();
     _pollTimer?.cancel();
     super.dispose();
@@ -217,6 +240,7 @@ class _DebugDashboardState extends State<DebugDashboard>
             Tab(icon: Icon(Icons.show_chart, size: 18), text: 'Speed'),
             Tab(icon: Icon(Icons.account_tree, size: 18), text: 'States'),
             Tab(icon: Icon(Icons.bug_report, size: 18), text: 'Simulate'),
+            Tab(icon: Icon(Icons.terminal, size: 18), text: 'Terminal'),
             Tab(icon: Icon(Icons.download, size: 18), text: 'Dump'),
           ],
         ),
@@ -227,6 +251,7 @@ class _DebugDashboardState extends State<DebugDashboard>
           _buildSpeedTab(),
           _buildStateTab(),
           _buildSimulateTab(),
+          _buildTerminalTab(),
           _buildDumpTab(),
         ],
       ),
@@ -602,5 +627,79 @@ class _DebugDashboardState extends State<DebugDashboard>
         backgroundColor: Color(0xFF1B5E20),
       ));
     }
+  }
+  // ── Tab 5: Beautiful Terminal ──────────────────────────────────────────
+
+  Widget _buildTerminalTab() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('LIVE NATIVE ENGINE LOGS', style: TextStyle(
+                  color: Colors.greenAccent, fontSize: 10, letterSpacing: 2, 
+                  fontWeight: FontWeight.bold)),
+              Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.clear_all, color: Colors.white54, size: 20),
+                    tooltip: 'Clear terminal',
+                    onPressed: () => setState(() => _nativeLogs.clear()),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.copy, color: Colors.blueAccent, size: 20),
+                    tooltip: 'Copy all to clipboard',
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: _nativeLogs.join('\n')));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Logs copied to clipboard'),
+                          backgroundColor: Color(0xFF1B5E20))
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
+                boxShadow: [
+                  BoxShadow(color: Colors.greenAccent.withOpacity(0.05), blurRadius: 10, spreadRadius: 2)
+                ]
+              ),
+              child: ListView.builder(
+                controller: _terminalScroll,
+                itemCount: _nativeLogs.isNotEmpty ? _nativeLogs.length : 1,
+                itemBuilder: (context, i) {
+                  if (_nativeLogs.isEmpty) {
+                    return const SelectableText('No native logs yet. Try connecting...',
+                        style: TextStyle(color: Colors.white38, fontFamily: 'monospace', fontSize: 12));
+                  }
+                  final l = _nativeLogs[i];
+                  final isErr = l.contains('ERROR:');
+                  return SelectableText(
+                    l,
+                    style: TextStyle(
+                      color: isErr ? Colors.redAccent : Colors.greenAccent.withOpacity(0.9),
+                      fontFamily: 'monospace',
+                      fontSize: 11,
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      )
+    );
   }
 }

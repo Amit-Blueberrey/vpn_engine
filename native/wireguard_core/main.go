@@ -24,6 +24,14 @@ typedef struct {
     uint32_t rx_packets;
     uint32_t tx_packets;
 } WgMetrics;
+
+typedef void (*LogCallback)(const char* msg);
+
+static inline void call_log_callback(LogCallback cb, const char* msg) {
+    if (cb != NULL) {
+        cb(msg);
+    }
+}
 */
 import "C"
 
@@ -32,7 +40,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,7 +49,6 @@ import (
 	"golang.org/x/crypto/curve25519"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/ipc"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -59,30 +65,73 @@ const (
 // ─── Per-tunnel bookkeeping ──────────────────────────────────────────────────
 
 type tunnel struct {
-	dev     *device.Device
-	tunDev  tun.Device
-	uapi    net.Listener
-	state   int32
-	rxBytes uint64
-	txBytes uint64
-	rxPkts  uint32
-	txPkts  uint32
-	ticker  *time.Ticker
-	quit    chan struct{}
+	dev      *device.Device
+	tunDev   tun.Device
+	uapi     net.Listener
+	state    int32
+	rxBytes  uint64
+	txBytes  uint64
+	rxPkts   uint32
+	txPkts   uint32
+	lastHandshakeSec uint64
+	ticker   *time.Ticker
+	quit     chan struct{}
+	// Windows-only: stored so we can clean up routes on disconnect
+	tunName     string
+	tunEndpoint string // the server's public IP, needed for exclusion route cleanup
 }
-
-// ─── Global registry ─────────────────────────────────────────────────────────
 
 var (
 	mu       sync.Mutex
 	tunnels  = make(map[C.int32_t]*tunnel)
 	nextHdl  C.int32_t = 1
 	lastErr  string
+	
+	logMu        sync.Mutex
+	logCallback  C.LogCallback
 )
 
 func setError(msg string) C.int32_t {
 	lastErr = msg
 	return -1
+}
+
+// ─── Exported Logging Functions ──────────────────────────────────────────────
+
+//export wg_set_log_callback
+func wg_set_log_callback(cb C.LogCallback) {
+	logMu.Lock()
+	logCallback = cb
+	logMu.Unlock()
+}
+
+// nativeLog prints locally (fmt) and dispatches to Dart if cb is set
+func nativeLog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	// Print to native stdout for local C debugging
+	fmt.Printf("[wg-native] %s\n", msg)
+
+	logMu.Lock()
+	cb := logCallback
+	logMu.Unlock()
+
+	if cb != nil {
+		cMsg := C.CString(msg)
+		C.call_log_callback(cb, cMsg)
+		C.free(unsafe.Pointer(cMsg))
+	}
+}
+
+// Intercept Logger
+func createCustomLogger() *device.Logger {
+	return &device.Logger{
+		Verbosef: func(format string, args ...interface{}) {
+			nativeLog(format, args...)
+		},
+		Errorf: func(format string, args ...interface{}) {
+			nativeLog("ERROR: "+format, args...)
+		},
+	}
 }
 
 // ─── Exported C functions ────────────────────────────────────────────────────
@@ -101,19 +150,13 @@ func wg_tunnel_start(cfgC *C.char, nameC *C.char, fdC C.int32_t) C.int32_t {
 	var mtu int = 1420
 	var err error
 
-	if platformFd >= 0 {
-		// Android: VpnService gave us an fd we pass directly.
-		tunDev, err = tun.CreateTUNFromFile(os.NewFile(uintptr(platformFd), "vpn"), mtu)
-	} else {
-		// Linux / macOS / Windows: create a real kernel TUN/Wintun adapter.
-		tunDev, err = tun.CreateTUN(name, mtu)
-	}
+	tunDev, err = createTunDevice(name, mtu, platformFd)
 	if err != nil {
 		return setError(fmt.Sprintf("create TUN failed: %v", err))
 	}
 
 	// ── Bring up the WireGuard device ────────────────────────────────────
-	logger := device.NewLogger(device.LogLevelError, fmt.Sprintf("[%s] ", name))
+	logger := createCustomLogger()
 	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 
 	// ── Apply wg-quick style config via UAPI SetDevice ────────────────────
@@ -124,34 +167,29 @@ func wg_tunnel_start(cfgC *C.char, nameC *C.char, fdC C.int32_t) C.int32_t {
 	}
 
 	// ── Create UAPI socket listener (for stats) ───────────────────────────
-	uapiFile, err := ipc.UAPIOpen(name)
-	var uapiLn net.Listener
-	if err == nil {
-		uapiLn, err = ipc.UAPIListen(name, uapiFile)
-		if err != nil {
-			uapiLn = nil
-		}
-		if uapiLn != nil {
-			go func() {
-				for {
-					conn, err := uapiLn.Accept()
-					if err != nil {
-						return
-					}
-					go dev.IpcHandle(conn)
-				}
-			}()
-		}
-	}
+	uapiLn := setupUAPI(name, dev)
 
 	dev.Up()
 
+	// ── Windows: configure adapter IP, DNS, and routing ─────────────────
+	// This makes traffic actually flow through the tunnel.
+	meta := parseConfigMeta(cfg)
+	if meta.address != "" {
+		if err := configureWindowsInterface(name, meta.address, meta.dns, meta.endpoint); err != nil {
+			nativeLog("WARNING: Windows interface config failed: %v", err)
+		}
+	} else {
+		nativeLog("WARNING: No Address found in config ─ traffic routing skipped")
+	}
+
 	t := &tunnel{
-		dev:    dev,
-		tunDev: tunDev,
-		uapi:   uapiLn,
-		state:  stateConnected,
-		quit:   make(chan struct{}),
+		dev:         dev,
+		tunDev:      tunDev,
+		uapi:        uapiLn,
+		state:       stateConnected,
+		quit:        make(chan struct{}),
+		tunName:     name,
+		tunEndpoint: meta.endpoint,
 	}
 
 	// ── Start the stats-polling goroutine ─────────────────────────────────
@@ -188,12 +226,56 @@ func wg_tunnel_stop(handle C.int32_t) {
 	t.ticker.Stop()
 	close(t.quit)
 
+	// Cleanup Windows routing rules before tearing down
+	if t.tunName != "" {
+		removeWindowsRoutes(t.tunName, t.tunEndpoint)
+	}
+
 	t.dev.Down()
 	if t.uapi != nil {
 		t.uapi.Close()
 	}
 	t.dev.Close()
 	t.tunDev.Close()
+}
+
+// ─── Config metadata parser ───────────────────────────────────────────────
+
+type configMeta struct {
+	address  string
+	dns      string
+	endpoint string // server public IP, without port
+}
+
+// parseConfigMeta extracts the VPN client IP address, DNS and endpoint from a wg-quick block.
+func parseConfigMeta(cfg string) configMeta {
+	var m configMeta
+	for _, rawLine := range strings.Split(cfg, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(kv[0])) {
+		case "address":
+			m.address = strings.TrimSpace(kv[1])
+		case "dns":
+			// Use only the first DNS entry
+			m.dns = strings.TrimSpace(strings.SplitN(kv[1], ",", 2)[0])
+		case "endpoint":
+			// Strip port: "1.2.3.4:51820" → "1.2.3.4"
+			ep := strings.TrimSpace(kv[1])
+			if host, _, err := net.SplitHostPort(ep); err == nil {
+				m.endpoint = host
+			} else {
+				m.endpoint = ep
+			}
+		}
+	}
+	return m
 }
 
 //export wg_get_metrics
@@ -208,7 +290,7 @@ func wg_get_metrics(handle C.int32_t, out *C.WgMetrics) C.int32_t {
 	out.tx_bytes = C.uint64_t(t.txBytes)
 	out.rx_packets = C.uint32_t(t.rxPkts)
 	out.tx_packets = C.uint32_t(t.txPkts)
-	out.last_handshake_sec = 0 // populated by UAPI in production
+	out.last_handshake_sec = C.uint64_t(t.lastHandshakeSec)
 	return 0
 }
 
@@ -303,7 +385,6 @@ func wgQuickToIPC(cfg string) string {
 			inPeer = false
 			continue
 		case "[peer]":
-			b.WriteString("public_key=\n") // signals new peer to UAPI
 			inPeer = true
 			continue
 		}
@@ -318,20 +399,31 @@ func wgQuickToIPC(cfg string) string {
 		if !inPeer {
 			switch strings.ToLower(k) {
 			case "privatekey":
-				// Decode base64, re-encode as hex for UAPI
-				raw, _ := base64.StdEncoding.DecodeString(v)
-				b.WriteString("private_key=" + hex(raw) + "\n")
+				raw, err := base64.StdEncoding.DecodeString(v)
+				if err == nil && len(raw) == 32 {
+					b.WriteString("private_key=" + hex(raw) + "\n")
+				} else {
+					nativeLog("ERROR: Skip invalid private key (len=%d)", len(raw))
+				}
 			case "listenport":
 				b.WriteString("listen_port=" + v + "\n")
 			}
 		} else {
 			switch strings.ToLower(k) {
 			case "publickey":
-				raw, _ := base64.StdEncoding.DecodeString(v)
-				b.WriteString("public_key=" + hex(raw) + "\n")
+				raw, err := base64.StdEncoding.DecodeString(v)
+				if err == nil && len(raw) == 32 {
+					b.WriteString("public_key=" + hex(raw) + "\n")
+				} else {
+					nativeLog("ERROR: Skip invalid public key (len=%d)", len(raw))
+				}
 			case "presharedkey":
-				raw, _ := base64.StdEncoding.DecodeString(v)
-				b.WriteString("preshared_key=" + hex(raw) + "\n")
+				raw, err := base64.StdEncoding.DecodeString(v)
+				if err == nil && len(raw) == 32 {
+					b.WriteString("preshared_key=" + hex(raw) + "\n")
+				} else {
+					nativeLog("ERROR: Skip invalid preshared key (len=%d)", len(raw))
+				}
 			case "endpoint":
 				b.WriteString("endpoint=" + v + "\n")
 			case "allowedips":
@@ -374,6 +466,9 @@ func pollStats(dev *device.Device, t *tunnel) {
 		case "tx_bytes":
 			v, _ := strconv.ParseUint(kv[1], 10, 64)
 			t.txBytes = v
+		case "last_handshake_time_sec":
+			v, _ := strconv.ParseUint(kv[1], 10, 64)
+			t.lastHandshakeSec = v
 		}
 	}
 }

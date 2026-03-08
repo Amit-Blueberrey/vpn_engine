@@ -20,6 +20,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../models/vpn_models.dart';
+import '../services/server_repository.dart';
 import 'vpn_core_ffi.dart';
 
 // ─── Platform channels (Android only) ────────────────────────────────────────
@@ -42,7 +43,21 @@ class VpnEngine extends ChangeNotifier {
   VpnMetrics _metrics = VpnMetrics.zero();
   VpnMetrics get metrics => _metrics;
 
+  // Per-second speed (bytes/s) — computed as delta between polls
+  double _speedRx = 0;
+  double _speedTx = 0;
+  double get speedRx => _speedRx;
+  double get speedTx => _speedTx;
+
+  // Rolling 30-second history for the sparkline chart
+  final List<double> rxHistory = List.filled(30, 0);
+  final List<double> txHistory = List.filled(30, 0);
+
+  VpnMetrics? _prevMetrics;
   int _handle = -1;
+
+  // Track the server being connected
+  SavedServer? _pendingServer;
 
   // ── Streams ──────────────────────────────────────────────────────────────────
   final _stateController   = StreamController<VpnState>.broadcast();
@@ -50,14 +65,16 @@ class VpnEngine extends ChangeNotifier {
 
   Stream<VpnState>   get stateStream   => _stateController.stream;
   Stream<VpnMetrics> get metricsStream => _metricsController.stream;
+  Stream<String>     get nativeLogsStream => WireGuardCore.instance.nativeLogsStream;
 
   Timer? _pollTimer;
   StreamSubscription? _androidFdSub;
 
   // ── Connect ──────────────────────────────────────────────────────────────────
 
-  Future<void> connect(VpnConfig config) async {
+  Future<void> connect(VpnConfig config, {SavedServer? serverMetadata}) async {
     if (_state == VpnState.connected || _state == VpnState.connecting) return;
+    _pendingServer = serverMetadata;
     _emitState(VpnState.connecting);
     _log('Connecting to ${config.endpoint}... (fallback=${config.autoFallback})');
 
@@ -123,21 +140,29 @@ class VpnEngine extends ChangeNotifier {
 
   Future<void> _connectDirect(VpnConfig config) async {
     final cfgStr = config.toWgQuickConfig();
-    if (config.autoFallback && config.relayUrl.isNotEmpty) {
-      _log('Using TCP fallback mode (relay=${config.relayUrl})');
-      _handle = WireGuardCore.instance.tunnelStartWithFallback(
-        cfgStr,
-        name: config.tunnelName,
-        relayUrl: config.relayUrl,
-        relayToken: config.relayToken,
-        handshakeTimeoutSec: 5,
-      );
-    } else {
-      _handle = WireGuardCore.instance.tunnelStart(cfgStr, name: config.tunnelName);
+    try {
+      if (config.autoFallback && config.relayUrl.isNotEmpty) {
+        _log('UDP handshake start (fallback available via ${config.relayUrl})');
+        _handle = WireGuardCore.instance.tunnelStartWithFallback(
+          cfgStr,
+          name: config.tunnelName,
+          relayUrl: config.relayUrl,
+          relayToken: config.relayToken,
+          handshakeTimeoutSec: 10, // Increased for first-time wintun initialization
+        );
+      } else {
+        _handle = WireGuardCore.instance.tunnelStart(cfgStr, name: config.tunnelName);
+      }
+      _log('Tunnel started, handle=$_handle');
+      _emitState(VpnState.connected);
+      _startPoll();
+    } on WgException catch (e) {
+      _log('Native WireGuard Error: ${e.message}', isError: true);
+      _emitState(VpnState.error);
+    } catch (e) {
+      _log('Unexpected error: $e', isError: true);
+      _emitState(VpnState.error);
     }
-    _log('Tunnel started, handle=$_handle');
-    _emitState(VpnState.connected);
-    _startPoll();
   }
 
   Future<void> _connectAndroid(VpnConfig config) async {
@@ -202,10 +227,37 @@ class VpnEngine extends ChangeNotifier {
 
   void _startPoll() {
     _pollTimer?.cancel();
+    _prevMetrics = null;
+    int successTicks = 0;
+
     _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_handle < 0) return;
       try {
         final m = WireGuardCore.instance.getMetrics(_handle);
+        
+        // Compute per-second deltas
+        if (_prevMetrics != null) {
+          _speedRx = (m.rxBytes - _prevMetrics!.rxBytes).toDouble().clamp(0, double.infinity);
+          _speedTx = (m.txBytes - _prevMetrics!.txBytes).toDouble().clamp(0, double.infinity);
+        } else {
+          _speedRx = 0;
+          _speedTx = 0;
+        }
+
+        // Logic for "Save on Success"
+        if (_pendingServer != null && m.rxBytes > 0) {
+          successTicks++;
+          if (successTicks >= 2) { // 2 seconds of traffic verified
+             ServerRepository.instance.addServer(_pendingServer!);
+             _pendingServer = null; 
+             _log('Connection verified. Server saved to local database.');
+          }
+        }
+
+        _prevMetrics = m;
+        // Rolling history
+        rxHistory.removeAt(0); rxHistory.add(_speedRx);
+        txHistory.removeAt(0); txHistory.add(_speedTx);
         _metrics = m;
         _emitMetrics(m);
       } catch (_) {}

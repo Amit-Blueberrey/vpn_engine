@@ -14,6 +14,7 @@
 ///   3. Thread-safety – the tunnel handle is an integer; Dart Isolate
 ///      model means only one thread calls native at a time.
 
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
@@ -60,6 +61,13 @@ typedef WgTunnelState = int Function(int handle);
 
 typedef _WgGetLastErrorNative = Pointer<Utf8> Function();
 typedef WgGetLastError = Pointer<Utf8> Function();
+
+typedef _LogCallbackNative = Void Function(Pointer<Utf8> msg);
+
+typedef _WgSetLogCallbackNative = Void Function(
+    Pointer<NativeFunction<_LogCallbackNative>> cb);
+typedef WgSetLogCallback = void Function(
+    Pointer<NativeFunction<_LogCallbackNative>> cb);
 
 typedef _WgGeneratePrivateKeyNative = Int32 Function(
     Pointer<Utf8> out, Int32 bufLen);
@@ -139,6 +147,9 @@ class WireGuardCore {
     _genPsk =
         _lib.lookupFunction<_WgGeneratePresharedKeyNative, WgGeneratePresharedKey>(
             'wg_generate_preshared_key');
+    _setLogCallback = 
+        _lib.lookupFunction<_WgSetLogCallbackNative, WgSetLogCallback>(
+            'wg_set_log_callback');
     // Fallback bindings
     _tunnelStartFallback =
         _lib.lookupFunction<_WgTunnelStartFallbackNative, WgTunnelStartFallback>(
@@ -165,6 +176,28 @@ class WireGuardCore {
   late final WgGeneratePrivateKey _genPrivKey;
   late final WgDerivePublicKey _derivePubKey;
   late final WgGeneratePresharedKey _genPsk;
+  late final WgSetLogCallback _setLogCallback;
+
+  // ── Native Log Routing ──────────────────────────────────────────────────────
+  
+  static final _nativeLogsController = StreamController<String>.broadcast();
+  Stream<String> get nativeLogsStream => _nativeLogsController.stream;
+
+  @pragma('vm:entry-point')
+  static void _nativeLogCallbackImpl(Pointer<Utf8> msgPtr) {
+    if (msgPtr != nullptr) {
+      final msg = msgPtr.toDartString();
+      if (!_nativeLogsController.isClosed) {
+        _nativeLogsController.add(msg);
+      }
+    }
+  }
+
+  void initializeLogging() {
+    final pointer = Pointer.fromFunction<_LogCallbackNative>(
+        _nativeLogCallbackImpl);
+    _setLogCallback(pointer);
+  }
   // Fallback
   late final WgTunnelStartFallback _tunnelStartFallback;
   late final WgStopFallback _stopFallback;

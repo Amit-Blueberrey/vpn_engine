@@ -1,49 +1,295 @@
+/// vpn_engine.dart
+///
+/// Phase 4: The main VpnEngine controller.
+///
+/// This is the single public API that the Flutter UI touches.
+/// It owns:
+///   - The actual native tunnel handle
+///   - Stream<VpnState>   – connection state changes
+///   - Stream<VpnMetrics> – 1-second telemetry ticks
+///
+/// Platform dispatch:
+///   Android   → sends config to the MethodChannel; receives fd via EventChannel,
+///               then calls WireGuardCore.tunnelStart(config, fd: fd).
+///   iOS/macOS → activates NEVPNManager via the SystemVpnManager helper.
+///   Win/Linux → calls WireGuardCore.tunnelStart() directly (no fd needed).
+
+import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:wireguard_flutter/wireguard_flutter.dart';
+import 'package:flutter/services.dart';
+
+import '../models/vpn_models.dart';
+import 'vpn_core_ffi.dart';
+
+// ─── Platform channels (Android only) ────────────────────────────────────────
+
+const _kMethodChannel = MethodChannel('com.amitb.vpn/engine');
+const _kEventChannel  = EventChannel('com.amitb.vpn/tunnel_fd');
+
+// ─── VpnEngine ────────────────────────────────────────────────────────────────
 
 class VpnEngine extends ChangeNotifier {
-  final WireGuardFlutter _wireguard = WireGuardFlutter.instance;
 
-  VpnStage _vpnStage = VpnStage.disconnected;
-  VpnStage get vpnStage => _vpnStage;
+  // ── Singleton ───────────────────────────────────────────────────────────────
+  VpnEngine._();
+  static final VpnEngine instance = VpnEngine._();
 
-  String _tunnelName = 'my_vpn_tunnel';
+  // ── State ───────────────────────────────────────────────────────────────────
+  VpnState _state = VpnState.disconnected;
+  VpnState get state => _state;
 
-  VpnEngine() {
-    _wireguard.vpnStageSnapshot.listen((event) {
-      _vpnStage = event;
-      notifyListeners();
+  VpnMetrics _metrics = VpnMetrics.zero();
+  VpnMetrics get metrics => _metrics;
+
+  int _handle = -1;
+
+  // ── Streams ──────────────────────────────────────────────────────────────────
+  final _stateController   = StreamController<VpnState>.broadcast();
+  final _metricsController = StreamController<VpnMetrics>.broadcast();
+
+  Stream<VpnState>   get stateStream   => _stateController.stream;
+  Stream<VpnMetrics> get metricsStream => _metricsController.stream;
+
+  Timer? _pollTimer;
+  StreamSubscription? _androidFdSub;
+
+  // ── Connect ──────────────────────────────────────────────────────────────────
+
+  Future<void> connect(VpnConfig config) async {
+    if (_state == VpnState.connected || _state == VpnState.connecting) return;
+    _emitState(VpnState.connecting);
+    _log('Connecting to ${config.endpoint}... (fallback=${config.autoFallback})');
+
+    try {
+      if (Platform.isAndroid) {
+        await _connectAndroid(config);
+      } else if (Platform.isIOS || Platform.isMacOS) {
+        await _connectApple(config);
+      } else {
+        await _connectDirect(config);
+      }
+    } catch (e) {
+      _log('Connect error: $e', isError: true);
+      _emitState(VpnState.error);
+    }
+  }
+
+  // ── Disconnect ──────────────────────────────────────────────────────────────
+
+  Future<void> disconnect() async {
+    if (_state == VpnState.disconnected) return;
+    _emitState(VpnState.disconnecting);
+    _log('Disconnecting...');
+    _stopPoll();
+
+    try {
+      if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+        // Signal the platform; the native side will call wg_tunnel_stop.
+        await _kMethodChannel.invokeMethod('stopVpn');
+      } else {
+        if (_handle >= 0) {
+          WireGuardCore.instance.tunnelStopWithFallback(_handle);
+          _handle = -1;
+        }
+      }
+    } catch (e) {
+      _log('Disconnect error: $e', isError: true);
+    } finally {
+      _emitState(VpnState.disconnected);
+      _emitMetrics(VpnMetrics.zero());
+    }
+  }
+
+  // ── Key generation ──────────────────────────────────────────────────────────
+
+  /// Generates a Curve25519 private key directly via native FFI.
+  String generatePrivateKey() {
+    try {
+      return WireGuardCore.instance.generatePrivateKey();
+    } catch (e) {
+      _log('keygen error: $e', isError: true);
+      rethrow;
+    }
+  }
+
+  String derivePublicKey(String privateKey) =>
+      WireGuardCore.instance.derivePublicKey(privateKey);
+
+  String generatePresharedKey() =>
+      WireGuardCore.instance.generatePresharedKey();
+
+  // ── Platform-specific internals ─────────────────────────────────────────────
+
+  Future<void> _connectDirect(VpnConfig config) async {
+    final cfgStr = config.toWgQuickConfig();
+    if (config.autoFallback && config.relayUrl.isNotEmpty) {
+      _log('Using TCP fallback mode (relay=${config.relayUrl})');
+      _handle = WireGuardCore.instance.tunnelStartWithFallback(
+        cfgStr,
+        name: config.tunnelName,
+        relayUrl: config.relayUrl,
+        relayToken: config.relayToken,
+        handshakeTimeoutSec: 5,
+      );
+    } else {
+      _handle = WireGuardCore.instance.tunnelStart(cfgStr, name: config.tunnelName);
+    }
+    _log('Tunnel started, handle=$_handle');
+    _emitState(VpnState.connected);
+    _startPoll();
+  }
+
+  Future<void> _connectAndroid(VpnConfig config) async {
+    // 1. Ask Android to grant VPN permission.
+    final granted = await _kMethodChannel.invokeMethod<bool>('prepare');
+    if (granted != true) {
+      _log('VPN permission denied', isError: true);
+      _emitState(VpnState.disconnected);
+      return;
+    }
+
+    // 2. Subscribe to the EventChannel BEFORE starting the service.
+    final completer = Completer<Map<dynamic, dynamic>>();
+    _androidFdSub = _kEventChannel.receiveBroadcastStream().listen((event) {
+      if (!completer.isCompleted) completer.complete(event as Map<dynamic, dynamic>);
+    });
+
+    // 3. Start the VpnService — it will call VpnService.Builder.establish()
+    //    and push the fd into our EventChannel.
+    await _kMethodChannel.invokeMethod('startVpn', {
+      'config': config.toWgQuickConfig(),
+      'dns':    config.dns ?? '1.1.1.1',
+    });
+
+    // 4. Wait for the fd (with timeout).
+    final Map<dynamic, dynamic> payload = await completer.future
+        .timeout(const Duration(seconds: 10));
+    await _androidFdSub?.cancel();
+
+    final fd     = (payload['fd'] as int?) ?? -1;
+    final cfgStr = (payload['config'] as String?) ?? config.toWgQuickConfig();
+
+    if (fd < 0) {
+      _log('Invalid fd received from Android', isError: true);
+      _emitState(VpnState.error);
+      return;
+    }
+
+    // 5. Now we have the OS-sanctioned fd — hand it to the native core.
+    _handle = WireGuardCore.instance.tunnelStart(cfgStr,
+        name: config.tunnelName, fd: fd);
+    _log('Android tunnel started, handle=$_handle, fd=$fd');
+    _emitState(VpnState.connected);
+    _startPoll();
+  }
+
+  Future<void> _connectApple(VpnConfig config) async {
+    // iOS/macOS: the system NetworkExtension process handles wg_tunnel_start.
+    // We only need to tell the main app to activate NEVPNManager.
+    await _kMethodChannel.invokeMethod('startVpn', {
+      'config': config.toWgQuickConfig(),
+    });
+
+    // State updates come via NEVPNStatusDidChange notifications forwarded
+    // through the MethodChannel's event side. For simplicity we optimistically
+    // move to connected; a full implementation would await the notification.
+    _emitState(VpnState.connected);
+    _startPoll();
+  }
+
+  // ── Telemetry polling ───────────────────────────────────────────────────────
+
+  void _startPoll() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_handle < 0) return;
+      try {
+        final m = WireGuardCore.instance.getMetrics(_handle);
+        _metrics = m;
+        _emitMetrics(m);
+      } catch (_) {}
     });
   }
 
-  Future<void> initialize({String tunnelName = 'my_vpn_tunnel'}) async {
-    _tunnelName = tunnelName;
-    try {
-      await _wireguard.initialize(tunnelName: tunnelName);
-    } catch (e) {
-      debugPrint("Init error: $e");
+  void _stopPoll() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  // ── Stream helpers ──────────────────────────────────────────────────────────
+
+  void _emitState(VpnState s) {
+    _state = s;
+    _stateController.add(s);
+    notifyListeners();
+  }
+
+  void _emitMetrics(VpnMetrics m) {
+    _metricsController.add(m);
+    notifyListeners();
+  }
+
+  // ── Logging (public for debug dashboard) ─────────────────────────────────────
+
+  final List<String> logs = [];
+
+  void addLog(String msg, {bool isError = false}) => _log(msg, isError: isError);
+
+  void _log(String msg, {bool isError = false}) {
+    final entry = '[${DateTime.now().toIso8601String()}] ${isError ? "ERROR" : "INFO"}: $msg';
+    logs.add(entry);
+    if (isError) debugPrint('\x1B[31m$entry\x1B[0m');
+    else debugPrint(entry);
+    notifyListeners();
+  }
+
+  // ── Debug Simulation Methods ─────────────────────────────────────────────────
+  // These are TESTING ONLY methods consumed by DebugDashboard.
+
+  void simulateFallbackTrigger() {
+    _log('[SIM] UDP Block simulated — autoFallback would activate in 5s');
+    _emitState(VpnState.connecting);
+    Future.delayed(const Duration(seconds: 1), () {
+      if (_state == VpnState.connecting) {
+        _log('[SIM] Fallback triggered — in production TCP relay activates here');
+        _emitState(VpnState.connected);
+      }
+    });
+  }
+
+  void simulateSleep() {
+    _log('[SIM] Simulating CPU sleep — pausing poll for 5 seconds');
+    _stopPoll();
+    Future.delayed(const Duration(seconds: 5), () {
+      _log('[SIM] Woke up from sleep — resuming poll');
+      _startPoll();
+    });
+  }
+
+  void simulateNetworkSwitch() {
+    _log('[SIM] Wi-Fi → Cellular switch detected — triggering reconnect');
+    if (_state == VpnState.connected) {
+      _emitState(VpnState.connecting);
+      Future.delayed(const Duration(seconds: 2), () {
+        _log('[SIM] Reconnect complete after network switch');
+        _emitState(VpnState.connected);
+      });
     }
   }
 
-  Future<void> connect(String config) async {
-    try {
-      if (_vpnStage == VpnStage.connected) return;
-      
-      await _wireguard.startVpn(
-        serverAddress: '127.0.0.1', 
-        wgQuickConfig: config,
-        providerBundleIdentifier: 'com.amitb.vpn', 
-      );
-    } catch (e) {
-      debugPrint("Failed to connect: $e");
-    }
+  void simulateAbruptKill() {
+    _log('[SIM] Abrupt kill — invalidating tunnel handle', isError: true);
+    _stopPoll();
+    _handle = -1;
+    _emitState(VpnState.error);
   }
 
-  Future<void> disconnect() async {
-    try {
-      await _wireguard.stopVpn();
-    } catch (e) {
-      debugPrint("Failed to disconnect: $e");
-    }
+  @override
+  void dispose() {
+    _stopPoll();
+    _stateController.close();
+    _metricsController.close();
+    super.dispose();
   }
 }

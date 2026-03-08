@@ -1,0 +1,230 @@
+name: Build WireGuard VPN Native Libraries
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+# ─── Permissions for artifact uploads ────────────────────────────────────────
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Linux → libwireguard.so (x86_64) + Android ABIs (arm64, armeabi, x86, x86_64)
+  # ────────────────────────────────────────────────────────────────────────────
+  build-linux-android:
+    runs-on: ubuntu-22.04
+    steps:
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Go 1.22
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          gcc g++ make curl unzip zip \
+          libssl-dev pkg-config
+
+    - name: Install Android NDK r26b
+      run: |
+        NDK_VERSION="android-ndk-r26b"
+        curl -fsSL "https://dl.google.com/android/repository/${NDK_VERSION}-linux.zip" -o ndk.zip
+        unzip -q ndk.zip -d "$HOME"
+        echo "ANDROID_NDK_HOME=$HOME/${NDK_VERSION}" >> $GITHUB_ENV
+
+    - name: Build Linux x86_64 libwireguard.so
+      run: |
+        chmod +x scripts/build_linux.sh
+        mkdir -p native/prebuilt/linux
+        bash scripts/build_linux.sh
+      env:
+        CGO_ENABLED: 1
+
+    - name: Build Android ABIs
+      run: |
+        chmod +x scripts/build_android.sh
+        bash scripts/build_android.sh
+      env:
+        ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        CGO_ENABLED: 1
+
+    - name: Verify output files
+      run: |
+        echo "── Linux ──"
+        ls -lh native/prebuilt/linux/ || true
+        echo "── Android ──"
+        find native/prebuilt/android -name "*.so" | xargs ls -lh || true
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libwireguard-linux-x86_64
+        path: native/prebuilt/linux/libwireguard.so
+        retention-days: 30
+
+    - name: Upload Android artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: libwireguard-android-abis
+        path: native/prebuilt/android/
+        retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Windows → wireguard.dll + wintun.dll
+  # ────────────────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-2022
+    steps:
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Go 1.22
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Install MinGW-w64 (GCC cross-toolchain for CGO)
+      run: choco install mingw --no-progress -y
+
+    - name: Add MinGW to PATH
+      run: echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Download Wintun DLL
+      run: |
+        Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+        Expand-Archive wintun.zip -DestinationPath wintun_extracted
+        New-Item -ItemType Directory -Force -Path native/prebuilt/windows
+        Copy-Item "wintun_extracted/wintun/bin/amd64/wintun.dll" "native/prebuilt/windows/wintun.dll"
+
+    - name: Build wireguard.dll
+      shell: bash
+      run: |
+        mkdir -p native/prebuilt/windows
+        cd native/wireguard_core
+        CGO_ENABLED=1 \
+          GOOS=windows \
+          GOARCH=amd64 \
+          CC=x86_64-w64-mingw32-gcc \
+          go build \
+            -buildmode=c-shared \
+            -ldflags="-s -w" \
+            -tags windows \
+            -o ../../native/prebuilt/windows/wireguard.dll \
+            .
+
+    - name: Verify output
+      run: |
+        dir native\prebuilt\windows\
+
+    - name: Upload Windows artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wireguard-windows-x64
+        path: |
+          native/prebuilt/windows/wireguard.dll
+          native/prebuilt/windows/wintun.dll
+        retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # macOS → WireGuard.xcframework (iOS device + iOS Simulator + macOS)
+  # ────────────────────────────────────────────────────────────────────────────
+  build-apple:
+    runs-on: macos-14  # M-series runner (arm64 host) for best Xcode coverage
+    steps:
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Go 1.22
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Install gomobile
+      run: go install golang.org/x/mobile/cmd/gomobile@latest && gomobile init
+
+    - name: Select Xcode 15
+      run: sudo xcode-select -s /Applications/Xcode.app
+
+    - name: Build WireGuard.xcframework
+      run: |
+        chmod +x scripts/build_apple.sh
+        bash scripts/build_apple.sh
+      env:
+        DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+    - name: Zip xcframework
+      run: |
+        cd native/prebuilt/apple
+        zip -r WireGuard.xcframework.zip WireGuard.xcframework
+
+    - name: Verify xcframework
+      run: |
+        ls -lh native/prebuilt/apple/
+
+    - name: Upload Apple xcframework
+      uses: actions/upload-artifact@v4
+      with:
+        name: WireGuard-xcframework
+        path: native/prebuilt/apple/WireGuard.xcframework.zip
+        retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Release: Create GitHub Release with all artifacts on main push
+  # ────────────────────────────────────────────────────────────────────────────
+  create-release:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [ build-linux-android, build-windows, build-apple ]
+    runs-on: ubuntu-22.04
+    steps:
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist/
+
+    - name: List distribution contents
+      run: find dist/ -type f | sort
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: build-${{ github.run_number }}
+        name: "WireGuard Engine Build #${{ github.run_number }}"
+        body: |
+          ## Auto-compiled WireGuard VPN Native Libraries
+
+          Built from commit `${{ github.sha }}`
+
+          ### Artifacts
+          | Platform | File |
+          |---|---|
+          | Linux x86_64 | `libwireguard-linux-x86_64` |
+          | Android (arm64/armeabi/x86/x86_64) | `libwireguard-android-abis` |
+          | Windows x64 | `wireguard-windows-x64` |
+          | iOS + macOS XCFramework | `WireGuard-xcframework` |
+
+          > ⚠️ These are unsigned development builds. Production builds require code-signing.
+        files: |
+          dist/libwireguard-linux-x86_64/libwireguard.so
+          dist/libwireguard-android-abis/**/*.so
+          dist/wireguard-windows-x64/wireguard.dll
+          dist/wireguard-windows-x64/wintun.dll
+          dist/WireGuard-xcframework/WireGuard.xcframework.zip
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

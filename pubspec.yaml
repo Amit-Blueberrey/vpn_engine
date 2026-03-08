@@ -63,7 +63,11 @@ dependencies:
 
   # ── Intl/formatting ──────────────────────────────────────────────────────────
   intl: ^0.20.2
-  wireguard_flutter: ^0.1.3
+  # ── FFI (required for native WireGuard bindings) ───────────────────────────
+  ffi: ^2.1.3
+
+  # ── Fonts ────────────────────────────────────────────────────────────────────
+  google_fonts: ^6.2.1
 
 dev_dependencies:
   flutter_test:
@@ -74,7 +78,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/animations/
-    - assets/icons/
-    - assets/images/
